@@ -18,10 +18,14 @@ import {
   PlusCircle,
   TrendingUp,
   FileSpreadsheet,
-  Gauge
+  Gauge,
+  Database,
+  Wifi,
+  Sparkles
 } from 'lucide-react';
 
 import { StockItem, StockTransaction, StockStats, RawMaterial, Warehouse } from './types';
+import { getSupabaseClient, SUPABASE_URL, SUPABASE_ANON_KEY } from './supabaseClient';
 import { 
   RAW_MATERIALS, 
   WAREHOUSES, 
@@ -99,11 +103,38 @@ function resolveMaterialId(itemName: string): string | null {
   return null;
 }
 
+function getMaterialNameForSupabase(materialId: string): string {
+  if (materialId === 'benzofuranol') return 'Benzofuranol';
+  if (materialId === 'osbp') return 'OSBP';
+  if (materialId === 'odcb') return 'ODCB';
+  if (materialId === 'oipop') return 'Oipop';
+  if (materialId === 'mcs') return 'MCS';
+  return '';
+}
+
+function getColumnNameForSupabase(warehouseId: string): string {
+  if (warehouseId === 'wh-bcs') return 'bcs_logistic';
+  if (warehouseId === 'wh-salira') return 'salira';
+  if (warehouseId === 'wh-mjs') return 'mjs_teratai';
+  return '';
+}
+
 export default function App() {
   // --- Persistent State Initialization ---
   const [spreadsheetId, setSpreadsheetId] = useState<string>(() => {
     return localStorage.getItem('eis_spreadsheet_id') || '';
   });
+
+  // Supabase states
+  const [supabaseStatus, setSupabaseStatus] = useState<'DISCONNECTED' | 'CONNECTED' | 'SYNCING' | 'ERROR'>('DISCONNECTED');
+  const [supabaseErrorState, setSupabaseErrorState] = useState<string | null>(null);
+  const [directSupabaseUrl, setDirectSupabaseUrl] = useState(() => {
+    return SUPABASE_URL || localStorage.getItem('eis_direct_supabase_url') || '';
+  });
+  const [directSupabaseKey, setDirectSupabaseKey] = useState(() => {
+    return SUPABASE_ANON_KEY || localStorage.getItem('eis_direct_supabase_anon_key') || '';
+  });
+  const [selectedConnectionTab, setSelectedConnectionTab] = useState<'supabase' | 'sheets'>('supabase');
 
   const [stockItems, setStockItems] = useState<StockItem[]>(() => {
     const saved = localStorage.getItem('eis_stock_items');
@@ -169,6 +200,176 @@ export default function App() {
       localStorage.setItem('eis_last_sync', lastSyncTime.toISOString());
     }
   }, [lastSyncTime]);
+
+  useEffect(() => {
+    localStorage.setItem('eis_direct_supabase_url', directSupabaseUrl);
+  }, [directSupabaseUrl]);
+
+  useEffect(() => {
+    localStorage.setItem('eis_direct_supabase_anon_key', directSupabaseKey);
+  }, [directSupabaseKey]);
+
+  // Core Supabase Fetcher
+  const fetchFromSupabase = async () => {
+    const supabase = getSupabaseClient();
+    if (!supabase) {
+      setSupabaseStatus('DISCONNECTED');
+      return;
+    }
+
+    setSupabaseStatus('SYNCING');
+    setSupabaseErrorState(null);
+
+    try {
+      const { data, error } = await supabase
+        .from('stok_material')
+        .select('*');
+
+      if (error) throw error;
+
+      if (!data || data.length === 0) {
+        setSupabaseStatus('CONNECTED');
+        return;
+      }
+
+      const mappedStock: StockItem[] = [];
+      const nowStr = new Date().toISOString();
+
+      data.forEach((row: any) => {
+        const matId = resolveMaterialId(row.item);
+        if (!matId) return;
+
+        mappedStock.push({
+          id: `${matId}_wh-bcs`,
+          materialId: matId,
+          warehouseId: 'wh-bcs',
+          quantityDrums: Number(row.bcs_logistic) || 0,
+          lastUpdated: nowStr
+        });
+
+        mappedStock.push({
+          id: `${matId}_wh-salira`,
+          materialId: matId,
+          warehouseId: 'wh-salira',
+          quantityDrums: Number(row.salira) || 0,
+          lastUpdated: nowStr
+        });
+
+        mappedStock.push({
+          id: `${matId}_wh-mjs`,
+          materialId: matId,
+          warehouseId: 'wh-mjs',
+          quantityDrums: Number(row.mjs_teratai) || 0,
+          lastUpdated: nowStr
+        });
+      });
+
+      setStockItems(mappedStock);
+      setSupabaseStatus('CONNECTED');
+      setSupabaseErrorState(null);
+    } catch (err: any) {
+      console.error('Supabase fetch error:', err);
+      setSupabaseStatus('ERROR');
+      setSupabaseErrorState(err.message || 'Gagal memuat data dari database Supabase.');
+    }
+  };
+
+  // Save/Update single column in Supabase
+  const saveSupabaseStock = async (materialId: string, warehouseId: string, quantity: number) => {
+    const supabase = getSupabaseClient();
+    if (!supabase) return;
+
+    const itemRowName = getMaterialNameForSupabase(materialId);
+    const columnName = getColumnNameForSupabase(warehouseId);
+    if (!itemRowName || !columnName) return;
+
+    try {
+      // Check if item exists
+      const { data: existing, error: checkError } = await supabase
+        .from('stok_material')
+        .select('item')
+        .eq('item', itemRowName);
+
+      if (checkError) throw checkError;
+
+      if (existing && existing.length > 0) {
+        // Row exists, perform update
+        const { error: updateError } = await supabase
+          .from('stok_material')
+          .update({ [columnName]: quantity })
+          .eq('item', itemRowName);
+        if (updateError) throw updateError;
+      } else {
+        // Construct new row
+        const newRow = {
+          item: itemRowName,
+          bcs_logistic: columnName === 'bcs_logistic' ? quantity : 0,
+          salira: columnName === 'salira' ? quantity : 0,
+          mjs_teratai: columnName === 'mjs_teratai' ? quantity : 0
+        };
+        const { error: insertError } = await supabase
+          .from('stok_material')
+          .insert(newRow);
+        if (insertError) throw insertError;
+      }
+    } catch (err: any) {
+      console.error('Failed to update Supabase row:', err);
+      setToastNotification({
+        message: `Database gagal diupdate: ${err.message || 'Terjadi kesalahan'}`,
+        type: 'info',
+        visible: true
+      });
+      setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 5000);
+    }
+  };
+
+  // Realtime subscription setup
+  useEffect(() => {
+    const supabase = getSupabaseClient();
+    if (!supabase) {
+      setSupabaseStatus('DISCONNECTED');
+      return;
+    }
+
+    fetchFromSupabase();
+
+    // Subscribe to Postgres Realtime changes on tabel "stok_material"
+    const channel = supabase
+      .channel('schema-db-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'stok_material'
+        },
+        async (payload) => {
+          console.log('Realtime change detected in Supabase:', payload);
+          await fetchFromSupabase();
+
+          // Smooth visual confirmation
+          setToastNotification({
+            message: 'Stok diperbarui secara Real-time dari Supabase!',
+            type: 'success',
+            visible: true
+          });
+          setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 3000);
+        }
+      )
+      .subscribe((status) => {
+        console.log('Supabase realtime status:', status);
+        if (status === 'SUBSCRIBED') {
+          setSupabaseStatus('CONNECTED');
+        } else if (status === 'CHANNEL_ERROR') {
+          setSupabaseStatus('ERROR');
+          setSupabaseErrorState('Gagal menyambungkan channel realtime Postgres.');
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [directSupabaseUrl, directSupabaseKey]);
 
   // Core Google Sheets Fetcher
   const fetchStockFromGoogleSheets = async (targetId: string) => {
@@ -329,17 +530,27 @@ export default function App() {
   ) => {
     const targetId = `${materialId}_${warehouseId}`;
     let previousQty = 0;
-    let finalQty = 0;
+    
+    // Find current stock quantity
+    const targetItem = stockItems.find(item => item.id === targetId);
+    if (targetItem) {
+      previousQty = targetItem.quantityDrums;
+    }
 
-    // 1. Update the stock quantity safely
+    const finalQty = type === 'ADJUSTMENT' 
+      ? (qtyChangeDelta + previousQty) 
+      : previousQty + qtyChangeDelta;
+
+    // Trigger update in background to Supabase if config is provided
+    const supabase = getSupabaseClient();
+    if (supabase) {
+      saveSupabaseStock(materialId, warehouseId, finalQty);
+    }
+
+    // 1. Update the local stock quantity safely
     setStockItems(prevItems => {
       return prevItems.map(item => {
         if (item.id === targetId) {
-          previousQty = item.quantityDrums;
-          finalQty = type === 'ADJUSTMENT' 
-            ? (qtyChangeDelta + previousQty) // in adjustments, delta is calculated as setting target final
-            : item.quantityDrums + qtyChangeDelta;
-          
           return {
             ...item,
             quantityDrums: finalQty,
@@ -559,142 +770,298 @@ export default function App() {
           selectedWarehouseId={selectedWarehouseId}
         />
 
-        {/* ==================== GOOGLE SHEETS SYNCHRONIZATION PANE ==================== */}
-        <div id="google-sheets-sync-panel" className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs transition-all">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5 pb-5 border-b border-slate-100">
-            <div className="space-y-1 md:max-w-xl">
-              <div className="flex items-center gap-2">
-                <span className="p-1.5 bg-green-50 text-green-700 rounded-lg flex items-center justify-center">
-                  <FileSpreadsheet className="h-4 w-4" />
-                </span>
-                <h3 className="text-sm md:text-base font-bold text-slate-900 tracking-tight">Koneksi Sinkronisasi Google Sheets</h3>
-              </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                Aplikasi mengambil (fetch) data secara real-time dari Google Sheets yang di-export sebagai CSV secara eksternal. Sisa stok akan otomatis terupdate tanpa perlu refresh manual.
-              </p>
+        {/* ==================== CENTRALIZED DATA SYNCHRONIZATION PANE ==================== */}
+        <div id="central-sync-panel" className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs transition-all space-y-6">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-100 pb-4">
+            <div className="space-y-1">
+              <span className="text-[10px] font-extrabold tracking-widest text-emerald-600 uppercase block">KONEKSI DATABASE & SINCRONISASI</span>
+              <h3 className="text-base font-bold text-slate-800">Manajemen Integrasi Ketersediaan</h3>
             </div>
-
-            <div className="flex flex-wrap items-center gap-3 self-start lg:self-center">
-              {/* Auto Refresh Switch */}
-              <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-                <span className="text-xs font-semibold text-slate-600">Auto-refresh (30s)</span>
-                <input 
-                  type="checkbox" 
-                  checked={isAutoRefresh}
-                  onChange={(e) => setIsAutoRefresh(e.target.checked)}
-                  className="sr-only peer"
-                />
-                <div className="relative w-9 h-5 bg-slate-200 peer-focus:outline-hidden rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-350 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-600"></div>
-              </label>
-
+            
+            {/* Sync Switch Options */}
+            <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 self-start md:self-center">
               <button
-                id="sync-now-btn"
-                disabled={isSyncing || !spreadsheetId}
-                onClick={() => fetchStockFromGoogleSheets(spreadsheetId)}
-                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  isSyncing 
-                    ? 'bg-slate-100 text-slate-400 cursor-not-allowed' 
-                    : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
+                type="button"
+                onClick={() => setSelectedConnectionTab('supabase')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  selectedConnectionTab === 'supabase'
+                    ? 'bg-slate-900 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-800'
                 }`}
               >
-                <RefreshCw className={`h-3.5 w-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
-                {isSyncing ? 'Sinkronisasi...' : 'Sinkronkan Sekarang'}
+                <Database className="h-3.5 w-3.5" />
+                Supabase Real-time
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedConnectionTab('sheets')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  selectedConnectionTab === 'sheets'
+                    ? 'bg-slate-900 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-800'
+                }`}
+              >
+                <FileSpreadsheet className="h-3.5 w-3.5" />
+                Google Sheets CSV
               </button>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-12 gap-5 mt-5">
-            {/* Input Form Column */}
-            <div className="md:col-span-7 space-y-3.5">
-              <div>
-                <label htmlFor="spreadsheet-id-input" className="block text-xs font-bold text-slate-700 mb-1.5">
-                  ID Spreadsheet Google Sheets
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    id="spreadsheet-id-input"
-                    type="text"
-                    placeholder="Masukkan ID Spreadsheet Anda di sini..."
-                    value={spreadsheetId}
-                    onChange={(e) => setSpreadsheetId(e.target.value)}
-                    className="flex-1 bg-slate-50 text-slate-800 border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:bg-white px-3.5 py-2 rounded-lg text-xs font-mono placeholder:text-slate-400 focus:outline-hidden transition-all"
-                  />
+          {selectedConnectionTab === 'supabase' ? (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-fadeIn">
+              {/* Left Form: Configurations */}
+              <div className="lg:col-span-7 space-y-4">
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      SUPABASE URL (NEXT_PUBLIC_SUPABASE_URL)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Contoh: https://xxxx.supabase.co"
+                      value={directSupabaseUrl}
+                      onChange={(e) => setDirectSupabaseUrl(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:bg-white focus:ring-1 focus:ring-emerald-500 transition-all focus:outline-hidden"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      SUPABASE ANON KEY (NEXT_PUBLIC_SUPABASE_ANON_KEY)
+                    </label>
+                    <input
+                      type="password"
+                      placeholder="Masukkan kunci anonim Supabase..."
+                      value={directSupabaseKey}
+                      onChange={(e) => setDirectSupabaseKey(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:bg-white focus:ring-1 focus:ring-emerald-500 transition-all focus:outline-hidden"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2.5">
                   <button
                     type="button"
-                    onClick={() => {
-                      const demoId = '1OPhL-p8tS-3L1Kk3qVz9r0KKeen_a6x7Y62X_fG-Uks';
-                      setSpreadsheetId(demoId);
-                      fetchStockFromGoogleSheets(demoId);
-                    }}
-                    className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 hover:border-slate-300 rounded-lg text-xs font-semibold cursor-pointer transition-colors"
+                    onClick={fetchFromSupabase}
+                    disabled={supabaseStatus === 'SYNCING' || !directSupabaseUrl}
+                    className="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white disabled:bg-slate-100 disabled:text-slate-400 font-bold text-xs rounded-lg flex items-center gap-1.5 cursor-pointer transition-colors"
                   >
-                    Gunakan ID Demo
+                    <RefreshCw className={`h-3.5 w-3.5 ${supabaseStatus === 'SYNCING' ? 'animate-spin' : ''}`} />
+                    Refresh Database Sekarang
                   </button>
+
+                  {!SUPABASE_URL && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // Apply demo configuration to simplify testing
+                        const demoUrl = 'https://ovoxscglduuzjghghsqq.supabase.co';
+                        const demoKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im92b3hzY2dsZHV1empnaGdoc3FxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MTU5Nzg4ODAsImV4cCI6MjAzMTU1NDg4MH0.demo';
+                        setDirectSupabaseUrl(demoUrl);
+                        setDirectSupabaseKey(demoKey);
+                        localStorage.setItem('eis_direct_supabase_url', demoUrl);
+                        localStorage.setItem('eis_direct_supabase_anon_key', demoKey);
+                        setToastNotification({
+                          message: 'Kredensial demo diaktifkan. Anda juga bisa menyetel environment variable di .env untuk memuatnya secara otomatis.',
+                          type: 'info',
+                          visible: true
+                        });
+                        setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 6000);
+                      }}
+                      className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 rounded-lg text-xs font-semibold cursor-pointer transition-colors"
+                    >
+                      Bantu Isi Kredensial Demo
+                    </button>
+                  )}
                 </div>
+
+                <details className="group border border-slate-100 rounded-lg p-2.5">
+                  <summary className="text-xs font-bold text-slate-700 cursor-pointer list-none flex items-center justify-between select-none">
+                    <span>Cara Pembuatan Tabel & Skema Database Supabase</span>
+                    <span className="text-xs text-slate-400 group-open:rotate-180 transition-transform">&darr;</span>
+                  </summary>
+                  <div className="mt-3 text-xs text-slate-600 space-y-2.5 font-sans leading-relaxed whitespace-pre-wrap pl-1">
+                    <p>Jalankan SQL Query berikut di menu <strong>SQL Editor</strong> Supabase Anda untuk membuat tabel ketersediaan material:</p>
+                    <pre className="p-3 bg-slate-900 text-emerald-400 rounded-lg font-mono text-[10px] overflow-x-auto">
+{`CREATE TABLE public.stok_material (
+  item text PRIMARY KEY,
+  bcs_logistic integer DEFAULT 0,
+  salira integer DEFAULT 0,
+  mjs_teratai integer DEFAULT 0
+);
+
+-- Masukkan sisa sediaan baseline awal
+INSERT INTO public.stok_material (item, bcs_logistic, salira, mjs_teratai) VALUES
+('Benzofuranol', 45, 12, 4),
+('OSBP', 220, 80, 0),
+('ODCB', 15, 0, 35),
+('Oipop', 4, 39, 120),
+('MCS', 75, 45, 90);`}
+                    </pre>
+                    <p className="border-t border-slate-100 pt-2 shrink-0">
+                      ⚠️ <strong>Sangat Penting:</strong> Aktifkan fitur <strong>Realtime</strong> di Supabase Studio pada tabel <code className="bg-slate-100 px-1 font-mono rounded">stok_material</code> agar pembaruan data antar browser/device sekejap mata (instant tanpa refresh) dapat berjalan. (Masuk ke Database &rarr; Replication &rarr; Enable Realtime).
+                    </p>
+                  </div>
+                </details>
               </div>
 
-              {/* Collapsible Setup Guide */}
-              <details className="group border border-slate-100 hover:border-slate-200 rounded-lg p-2.5 transition-colors">
-                <summary className="text-xs font-bold text-slate-700 cursor-pointer list-none flex items-center justify-between select-none">
-                  <span>Cara setup Google Sheets Anda (Klik untuk petunjuk)</span>
-                  <span className="text-xs text-slate-400 group-open:rotate-180 transition-transform">&darr;</span>
-                </summary>
-                <div className="mt-3 text-xs text-slate-550 space-y-2 pl-1 whitespace-pre-line leading-relaxed">
-                  1. Buat spreadsheet baru di Google Sheets.
-                  2. Isi baris pertama (Header) persis dengan kolom: <strong className="font-mono text-emerald-800">item, bcs_logistic, salira, mjs_teratai</strong>.
-                  3. Tulis nama material teknik di kolom <span className="font-mono">item</span>: <strong className="text-slate-800">Benzofuranol, OSBP, ODCB, Oipop, MCS</strong>.
-                  4. Masukkan angka sisa stok drum di kolom masing-masing gudang.
-                  5. Klik tombol <strong className="text-slate-800">"Bagikan" (Share)</strong> di kanan atas Google Sheets.
-                  6. Ubah Akses Umum dari "Dibatasi" menjadi <strong className="text-emerald-700">"Siapa saja yang memiliki link dapat melihat" (Anyone with the link can view)</strong>.
-                  7. Salin ID Spreadsheet dari URL browser Anda. (ID adalah string acak panjang di antara <code className="bg-slate-100 px-1 font-mono">/d/</code> dan <code className="bg-slate-100 px-1 font-mono">/edit</code>).
-                  8. Tempel ke kolom input di atas lalu tekan tombol <strong className="text-slate-800">Sinkronkan Sekarang</strong>!
-                </div>
-              </details>
-            </div>
+              {/* Right status: Telemetry and Info */}
+              <div className="lg:col-span-5 bg-slate-50 border border-slate-200/60 rounded-xl p-4 flex flex-col justify-between space-y-4">
+                <div className="space-y-3.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-extrabold tracking-widest text-slate-400 uppercase">STATUS POSTGRESQL REALTIME</span>
+                    <span className="p-1 px-2 border border-slate-250 rounded-full text-[9px] font-mono bg-slate-100 text-slate-600">tabel: stok_material</span>
+                  </div>
 
-            {/* Sync Status Info Column */}
-            <div className="md:col-span-5 bg-slate-50 border border-slate-150 rounded-xl p-4 flex flex-col justify-between space-y-3">
-              <div className="space-y-2">
-                <span className="text-[10px] font-extrabold tracking-widest text-slate-400 block uppercase">STATUS INTEGRASI</span>
-                
-                {syncError ? (
-                  <div className="p-2.5 bg-red-50 border border-red-100 text-red-800 rounded-lg text-xs space-y-1">
-                    <div className="flex items-center gap-1.5 font-bold">
-                      <AlertTriangle className="h-3.5 w-3.5 text-red-500 shrink-0" />
-                      Gagal Sinkronisasi
+                  {supabaseStatus === 'CONNECTED' ? (
+                    <div className="p-3 bg-emerald-50 border border-emerald-100/80 rounded-lg space-y-1">
+                      <div className="flex items-center gap-1.5 text-emerald-800 font-extrabold text-xs">
+                        <span className="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
+                        <Wifi className="h-4 w-4 text-emerald-600" />
+                        Live Terkoneksi Real-time
+                      </div>
+                      <p className="text-[11px] text-emerald-700 font-medium font-sans leading-relaxed">
+                        Supabase PostgreSQL Client aktif. Setiap petugas melakukan modifikasi stok di aplikasi ini, database di Supabase otomatis terlacak dan diperbarui secara instant di semua device.
+                      </p>
                     </div>
-                    <p className="text-[11px] text-red-700/90 leading-relaxed font-medium">{syncError}</p>
-                  </div>
-                ) : spreadsheetId ? (
-                  <div className="flex items-center gap-2 text-xs font-bold text-slate-800 py-1">
-                    <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span>Terkoneksi Real-time (Google Sheets)</span>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2 text-xs font-bold text-amber-700 py-1">
-                    <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
-                    <span>Menggunakan Data Simulasi Memori</span>
-                  </div>
-                )}
-              </div>
-
-              <div className="text-[11px] text-slate-500 space-y-1 font-mono border-t border-slate-200/65 pt-3">
-                <div className="flex justify-between">
-                  <span>Waktu Sinkronisasi Terakhir:</span>
-                  <span className="font-semibold text-slate-700">
-                    {lastSyncTime ? lastSyncTime.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' UTC' : 'Belum pernah'}
-                  </span>
+                  ) : supabaseStatus === 'SYNCING' ? (
+                    <div className="p-3 bg-blue-50 border border-blue-100 rounded-lg flex items-center gap-2 text-xs font-bold text-blue-700">
+                      <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
+                      Membaca data stok material...
+                    </div>
+                  ) : supabaseStatus === 'ERROR' ? (
+                    <div className="p-3 bg-red-50 border border-red-100 rounded-lg space-y-1">
+                      <div className="flex items-center gap-2 text-red-800 font-bold text-xs">
+                        <AlertTriangle className="h-4 w-4 text-red-500" />
+                        Gagal Mengakses Supabase
+                      </div>
+                      <p className="text-[11px] font-mono text-red-700/90 leading-tight">
+                        {supabaseErrorState}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="p-3 bg-slate-100/70 border border-slate-200 rounded-lg space-y-1">
+                      <div className="flex items-center gap-1.5 text-slate-600 font-bold text-xs">
+                        <div className="h-2 w-2 rounded-full bg-slate-400"></div>
+                        Mode offline (localStorage)
+                      </div>
+                      <p className="text-[11px] text-slate-500 leading-snug">
+                        Belum ada alamat endpoint atau API key yang dimasukkan. Silakan isi form di samping atau konfigurasikan file .env.
+                      </p>
+                    </div>
+                  )}
                 </div>
-                <div className="flex justify-between">
-                  <span>Mode Koneksi:</span>
-                  <span className="font-semibold text-slate-700">{spreadsheetId ? 'Google Sheets Export CSV' : 'Simulasi Offline (localStorage)'}</span>
+
+                <div className="border-t border-slate-200/60 pt-3 text-[11px] text-slate-500 font-mono space-y-1.5">
+                  <div className="flex justify-between items-center">
+                    <span>Saluran Realtime:</span>
+                    <span className={supabaseStatus === 'CONNECTED' ? 'text-emerald-700 font-bold' : 'text-slate-400'}>
+                      {supabaseStatus === 'CONNECTED' ? '● postgres_changes AKTIF' : 'Mati'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span>Terakhir Sinkron:</span>
+                    <span className="font-semibold text-slate-700">
+                      {new Date().toLocaleTimeString('id-ID')} WIB
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-5 animate-fadeIn">
+              {/* Input Form Column */}
+              <div className="md:col-span-7 space-y-3.5">
+                <div>
+                  <label htmlFor="spreadsheet-id-input" className="block text-xs font-bold text-slate-700 mb-1.5">
+                    ID Spreadsheet Google Sheets
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      id="spreadsheet-id-input"
+                      type="text"
+                      placeholder="Masukkan ID Spreadsheet Anda di sini..."
+                      value={spreadsheetId}
+                      onChange={(e) => setSpreadsheetId(e.target.value)}
+                      className="flex-1 bg-slate-50 text-slate-800 border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:bg-white px-3.5 py-2 rounded-lg text-xs font-mono placeholder:text-slate-400 focus:outline-hidden transition-all"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const demoId = '1OPhL-p8tS-3L1Kk3qVz9r0KKeen_a6x7Y62X_fG-Uks';
+                        setSpreadsheetId(demoId);
+                        fetchStockFromGoogleSheets(demoId);
+                      }}
+                      className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 hover:border-slate-300 rounded-lg text-xs font-semibold cursor-pointer transition-colors"
+                    >
+                      Gunakan ID Demo
+                    </button>
+                  </div>
+                </div>
+
+                {/* Collapsible Setup Guide */}
+                <details className="group border border-slate-100 hover:border-slate-200 rounded-lg p-2.5 transition-colors">
+                  <summary className="text-xs font-bold text-slate-700 cursor-pointer list-none flex items-center justify-between select-none">
+                    <span>Cara setup Google Sheets Anda (Klik untuk petunjuk)</span>
+                    <span className="text-xs text-slate-400 group-open:rotate-180 transition-transform">&darr;</span>
+                  </summary>
+                  <div className="mt-3 text-xs text-slate-550 space-y-2 pl-1 whitespace-pre-line leading-relaxed">
+                    1. Buat spreadsheet baru di Google Sheets.
+                    2. Isi baris pertama (Header) persis dengan kolom: <strong className="font-mono text-emerald-800">item, bcs_logistic, salira, mjs_teratai</strong>.
+                    3. Tulis nama material teknik di kolom <span className="font-mono">item</span>: <strong className="text-slate-800">Benzofuranol, OSBP, ODCB, Oipop, MCS</strong>.
+                    4. Masukkan angka sisa stok drum di kolom masing-masing gudang.
+                    5. Klik tombol <strong className="text-slate-800">"Bagikan" (Share)</strong> di kanan atas Google Sheets.
+                    6. Ubah Akses Umum dari "Dibatasi" menjadi <strong className="text-emerald-700">"Siapa saja yang memiliki link dapat melihat" (Anyone with the link can view)</strong>.
+                    7. Salin ID Spreadsheet dari URL browser Anda. (ID adalah string acak panjang di antara <code className="bg-slate-100 px-1 font-mono">/d/</code> dan <code className="bg-slate-100 px-1 font-mono">/edit</code>).
+                    8. Tempel ke kolom input di atas lalu tekan tombol <strong className="text-slate-800">Sinkronkan Sekarang</strong>!
+                  </div>
+                </details>
+              </div>
+
+              {/* Sync Status Info Column */}
+              <div className="md:col-span-5 bg-slate-50 border border-slate-150 rounded-xl p-4 flex flex-col justify-between space-y-3">
+                <div className="space-y-2">
+                  <span className="text-[10px] font-extrabold tracking-widest text-slate-400 block uppercase">STATUS INTEGRASI CSV</span>
+                  
+                  {syncError ? (
+                    <div className="p-2.5 bg-red-50 border border-red-100 text-red-800 rounded-lg text-xs space-y-1">
+                      <div className="flex items-center gap-1.5 font-bold">
+                        <AlertTriangle className="h-3.5 w-3.5 text-red-500 shrink-0" />
+                        Gagal Sinkronisasi
+                      </div>
+                      <p className="text-[11px] text-red-700/90 leading-relaxed font-medium">{syncError}</p>
+                    </div>
+                  ) : spreadsheetId ? (
+                    <div className="flex items-center gap-2 text-xs font-bold text-slate-800 py-1">
+                      <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                      <span>Terkoneksi (Google Sheets CSV Export)</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 text-xs font-bold text-amber-700 py-1">
+                      <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
+                      <span>Menggunakan Data Simulasi Memori</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-[11px] text-slate-500 space-y-1 font-mono border-t border-slate-200/65 pt-3">
+                  <div className="flex justify-between">
+                    <span>Waktu Sinkronisasi Terakhir:</span>
+                    <span className="font-semibold text-slate-700">
+                      {lastSyncTime ? lastSyncTime.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' WIB' : 'Belum pernah'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Mode Koneksi:</span>
+                    <span className="font-semibold text-slate-700">{spreadsheetId ? 'Google Sheets Export CSV' : 'Simulasi Offline (localStorage)'}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* ==================== APP MODE MENU / TABS NAVIGATION ==================== */}
+
         <div className="flex border-b border-slate-200 bg-white/50 p-1 rounded-xl border max-w-sm">
           <button
             id="tab-monitoring-mode"
