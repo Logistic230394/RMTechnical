@@ -1,0 +1,6 @@
+{
+  "name": "External Inventory System",
+  "description": "Sistem Manajemen Stok Raw Material (RM) Technical Gudang Eksternal (EIS)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
