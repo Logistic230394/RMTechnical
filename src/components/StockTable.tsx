@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Search, 
@@ -24,6 +24,22 @@ import {
 import { RawMaterial, Warehouse, StockItem } from '../types';
 import { getStockStatus, STOCK_THRESHOLDS } from '../initialData';
 
+function getMaterialNameForSupabase(materialId: string): string {
+  if (materialId === 'benzofuranol') return 'Benzofuranol';
+  if (materialId === 'osbp') return 'OSBP';
+  if (materialId === 'odcb') return 'ODCB';
+  if (materialId === 'oipop') return 'Oipop';
+  if (materialId === 'mcs') return 'MCS';
+  return '';
+}
+
+function getColumnNameForSupabase(warehouseId: string): string {
+  if (warehouseId === 'wh-bcs') return 'bcs_logistic';
+  if (warehouseId === 'wh-salira') return 'salira';
+  if (warehouseId === 'wh-mjs') return 'mjs_teratai';
+  return '';
+}
+
 interface StockTableProps {
   stockItems: StockItem[];
   materials: RawMaterial[];
@@ -31,6 +47,8 @@ interface StockTableProps {
   selectedWarehouseId: string | null;
   onSelectWarehouse: (id: string | null) => void;
   onUpdateStockClick: (stockItem: StockItem) => void;
+  handleUpdateStok?: (itemName: string, warehouseName: string, newQty: number) => Promise<void>;
+  savingItems?: Record<string, boolean>;
 }
 
 type SortField = 'item' | 'warehouse' | 'qty' | 'weight' | 'status';
@@ -42,8 +60,22 @@ export default function StockTable({
   warehouses,
   selectedWarehouseId,
   onSelectWarehouse,
-  onUpdateStockClick
+  onUpdateStockClick,
+  handleUpdateStok = async () => {},
+  savingItems = {}
 }: StockTableProps) {
+  // Local edit states for numeric inputs to avoid cursor jumping or lagging
+  const [localQuantities, setLocalQuantities] = useState<Record<string, string | number>>({});
+
+  // Sync inputs with prop updates as soon as stockItems values refresh from backend
+  useEffect(() => {
+    const nextLocal: Record<string, number> = {};
+    stockItems.forEach(item => {
+      nextLocal[item.id] = item.quantityDrums;
+    });
+    setLocalQuantities(nextLocal);
+  }, [stockItems]);
+
   // Filters & Search State
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedMaterialId, setSelectedMaterialId] = useState<string>('all');
@@ -442,18 +474,63 @@ export default function StockTable({
                       </div>
                     </td>
 
-                    {/* Quantity (Drums) */}
-                    <td className="py-4 px-5 text-right font-semibold text-slate-800 font-mono">
-                      <span className="text-base">{item.quantityDrums}</span> <span className="text-xs font-normal text-slate-500">Drum</span>
+                    {/* Quantity (Drums) - Direct Editable with saving states */}
+                    <td className="py-4 px-5 text-right font-semibold text-slate-800 font-mono" style={{ width: '190px' }}>
+                      <div className="flex items-center justify-end gap-2">
+                        <div className="relative w-24">
+                          <input
+                            type="number"
+                            min="0"
+                            className="w-full bg-slate-50 hover:bg-slate-150/80 border border-slate-200 focus:bg-white focus:outline-hidden focus:ring-1 focus:ring-emerald-500 rounded px-2 py-1 text-sm font-semibold text-right text-slate-850"
+                            value={localQuantities[item.id] !== undefined ? localQuantities[item.id] : item.quantityDrums}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setLocalQuantities(prev => ({
+                                ...prev,
+                                [item.id]: val === '' ? '' : Math.max(0, parseInt(val) || 0)
+                              }));
+                            }}
+                            onBlur={() => {
+                              const val = localQuantities[item.id];
+                              if (val !== undefined && val !== '' && Number(val) !== item.quantityDrums) {
+                                const dbItemName = getMaterialNameForSupabase(item.materialId);
+                                const dbWhColumn = getColumnNameForSupabase(item.warehouseId);
+                                if (dbItemName && dbWhColumn) {
+                                  handleUpdateStok(dbItemName, dbWhColumn, Number(val));
+                                }
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                const val = localQuantities[item.id];
+                                if (val !== undefined && val !== '' && Number(val) !== item.quantityDrums) {
+                                  const dbItemName = getMaterialNameForSupabase(item.materialId);
+                                  const dbWhColumn = getColumnNameForSupabase(item.warehouseId);
+                                  if (dbItemName && dbWhColumn) {
+                                    handleUpdateStok(dbItemName, dbWhColumn, Number(val));
+                                  }
+                                }
+                                (e.target as HTMLInputElement).blur();
+                              }
+                            }}
+                          />
+                        </div>
+                        <div className="flex flex-col items-start text-left min-w-[70px]">
+                          <span className="text-xs font-normal text-slate-500">Drum</span>
+                          {savingItems[`${getMaterialNameForSupabase(item.materialId)}_${getColumnNameForSupabase(item.warehouseId)}`] && (
+                            <span className="text-[10px] text-emerald-600 font-sans font-bold leading-none animate-pulse block">Menyimpan...</span>
+                          )}
+                        </div>
+                      </div>
                     </td>
 
-                    {/* Total Weight in Kilograms */}
-                    <td className="py-4 px-5 text-right">
-                      <div className="font-semibold text-slate-950 font-mono">
-                        {item.totalWeightKg.toLocaleString('id-ID')} <span className="text-xs font-normal text-slate-500">Kg</span>
+                    {/* Total Weight in Kilograms - Dynamically reacts as they type */}
+                    <td className="py-2 px-5 text-right font-mono" style={{ width: '160px' }}>
+                      <div className="font-semibold text-slate-950">
+                        {((localQuantities[item.id] !== undefined ? Number(localQuantities[item.id]) || 0 : item.quantityDrums) * item.packagingWeightKg).toLocaleString('id-ID')} <span className="text-xs font-normal text-slate-500">Kg</span>
                       </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5 font-mono">
-                        {(item.totalWeightKg / 1000).toFixed(2)} Ton
+                      <div className="text-[10px] text-slate-400 mt-0.5">
+                        {(((localQuantities[item.id] !== undefined ? Number(localQuantities[item.id]) || 0 : item.quantityDrums) * item.packagingWeightKg) / 1000).toFixed(2)} Ton
                       </div>
                     </td>
 
@@ -516,13 +593,57 @@ export default function StockTable({
 
                     {/* Qty and Weight detail boxes */}
                     <div className="grid grid-cols-2 gap-2 bg-white rounded-lg p-2.5 border border-slate-200/50">
-                      <div className="text-center border-r border-slate-100">
+                      <div className="text-center border-r border-slate-100 flex flex-col justify-center items-center">
                         <span className="text-[10px] text-slate-400 block tracking-wider uppercase">DRUMS</span>
-                        <span className="font-bold text-slate-800 font-mono text-base">{item.quantityDrums}</span>
+                        <div className="flex flex-col items-center gap-0.5 mt-0.5">
+                          <input
+                            type="number"
+                            min="0"
+                            className="w-16 bg-slate-50 border border-slate-200 focus:bg-white focus:outline-hidden focus:ring-1 focus:ring-emerald-500 rounded px-1 text-center font-bold text-slate-800 text-xs"
+                            value={localQuantities[item.id] !== undefined ? localQuantities[item.id] : item.quantityDrums}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setLocalQuantities(prev => ({
+                                ...prev,
+                                [item.id]: val === '' ? '' : Math.max(0, parseInt(val) || 0)
+                              }));
+                            }}
+                            onBlur={() => {
+                              const val = localQuantities[item.id];
+                              if (val !== undefined && val !== '' && Number(val) !== item.quantityDrums) {
+                                const dbItemName = getMaterialNameForSupabase(item.materialId);
+                                const dbWhColumn = getColumnNameForSupabase(item.warehouseId);
+                                if (dbItemName && dbWhColumn) {
+                                  handleUpdateStok(dbItemName, dbWhColumn, Number(val));
+                                }
+                              }
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                const val = localQuantities[item.id];
+                                if (val !== undefined && val !== '' && Number(val) !== item.quantityDrums) {
+                                  const dbItemName = getMaterialNameForSupabase(item.materialId);
+                                  const dbWhColumn = getColumnNameForSupabase(item.warehouseId);
+                                  if (dbItemName && dbWhColumn) {
+                                    handleUpdateStok(dbItemName, dbWhColumn, Number(val));
+                                  }
+                                }
+                                (e.target as HTMLInputElement).blur();
+                              }
+                            }}
+                          />
+                          {savingItems[`${getMaterialNameForSupabase(item.materialId)}_${getColumnNameForSupabase(item.warehouseId)}`] ? (
+                            <span className="text-[8px] text-emerald-600 animate-pulse font-bold">Menyimpan...</span>
+                          ) : (
+                            <span className="text-[8px] text-slate-400 font-medium">onBlur/Enter</span>
+                          )}
+                        </div>
                       </div>
-                      <div className="text-center">
+                      <div className="text-center flex flex-col justify-center">
                         <span className="text-[10px] text-slate-400 block tracking-wider uppercase">BERAT (KG)</span>
-                        <span className="font-bold text-slate-800 font-mono text-base">{item.totalWeightKg.toLocaleString('id-ID')}</span>
+                        <span className="font-bold text-slate-800 font-mono text-sm">
+                          {((localQuantities[item.id] !== undefined ? Number(localQuantities[item.id]) || 0 : item.quantityDrums) * item.packagingWeightKg).toLocaleString('id-ID')}
+                        </span>
                       </div>
                     </div>
                   </div>

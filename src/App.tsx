@@ -164,6 +164,7 @@ export default function App() {
   // Dynamic mutation drawer control
   const [isUpdateDrawerOpen, setIsUpdateDrawerOpen] = useState(false);
   const [selectedStockToUpdate, setSelectedStockToUpdate] = useState<StockItem | null>(null);
+  const [savingItems, setSavingItems] = useState<Record<string, boolean>>({});
 
   // Feedback notifications (Success/Failure alerts)
   const [toastNotification, setToastNotification] = useState<{
@@ -320,6 +321,106 @@ export default function App() {
         visible: true
       });
       setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 5000);
+    }
+  };
+
+  // User Requested Function: handleUpdateStok
+  const handleUpdateStok = async (itemName: string, warehouseName: string, newQty: number) => {
+    const supabase = getSupabaseClient();
+    const saveKey = `${itemName}_${warehouseName}`;
+    
+    // Set loading indicator
+    setSavingItems(prev => ({ ...prev, [saveKey]: true }));
+    
+    // Resolve IDs for immediate local state synchronization
+    const matId = resolveMaterialId(itemName);
+    let whId = '';
+    if (warehouseName === 'bcs_logistic') whId = 'wh-bcs';
+    else if (warehouseName === 'salira') whId = 'wh-salira';
+    else if (warehouseName === 'mjs_teratai') whId = 'wh-mjs';
+
+    try {
+      if (supabase) {
+        // Precise query as requested
+        const { data, error } = await supabase
+          .from('stok_material')
+          .update({ [warehouseName]: newQty })
+          .eq('item', itemName);
+
+        if (error) {
+          throw error;
+        }
+
+        setToastNotification({
+          message: `Berhasil memperbarui stok ${itemName} di gudang ${
+            warehouseName === 'bcs_logistic' ? 'BCS Logistic' : warehouseName === 'salira' ? 'Salira' : 'MJS Teratai'
+          } menjadi ${newQty} drum.`,
+          type: 'success',
+          visible: true
+        });
+        setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 3000);
+      } else {
+        // Fallback info if Supabase client not set up / mock mode
+        setToastNotification({
+          message: `Stok ${itemName} diperbarui secara lokal (Mock/Offline) menjadi ${newQty} drum.`,
+          type: 'info',
+          visible: true
+        });
+        setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 3000);
+      }
+
+      // Live synchronisation of local state so the input doesn't feel laggy
+      if (matId && whId) {
+        const targetId = `${matId}_${whId}`;
+        setStockItems(prevItems => {
+          const updated = prevItems.map(item => {
+            if (item.id === targetId) {
+              return {
+                ...item,
+                quantityDrums: newQty,
+                lastUpdated: new Date().toISOString()
+              };
+            }
+            return item;
+          });
+          // Preserve in localStorage
+          localStorage.setItem('eis_stock_items', JSON.stringify(updated));
+          return updated;
+        });
+
+        // Log transaction record for comprehensive history audit
+        const newTx: StockTransaction = {
+          id: `tx-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          materialId: matId,
+          warehouseId: whId,
+          type: 'ADJUSTMENT',
+          quantityDrumsChanged: 0, // represented as adjustment
+          resultingQuantity: newQty,
+          notes: 'Penyesuaian stok langsung via input field',
+          operatorEmail: 'logistic.technical@gmail.com'
+        };
+        setTransactions(prevTxs => {
+          const updatedTxs = [newTx, ...prevTxs];
+          localStorage.setItem('eis_transactions', JSON.stringify(updatedTxs));
+          return updatedTxs;
+        });
+      }
+    } catch (err: any) {
+      console.error('Failed to update Supabase row via handleUpdateStok:', err);
+      setToastNotification({
+        message: `Database gagal diupdate: ${err.message || 'Terjadi kesalahan'}`,
+        type: 'info',
+        visible: true
+      });
+      setTimeout(() => setToastNotification(prev => ({ ...prev, visible: false })), 5000);
+    } finally {
+      // Remove loading indicator
+      setSavingItems(prev => {
+        const updated = { ...prev };
+        delete updated[saveKey];
+        return updated;
+      });
     }
   };
 
@@ -1105,6 +1206,8 @@ INSERT INTO public.stok_material (item, bcs_logistic, salira, mjs_teratai) VALUE
               selectedWarehouseId={selectedWarehouseId}
               onSelectWarehouse={setSelectedWarehouseId}
               onUpdateStockClick={handleOpenStockUpdate}
+              handleUpdateStok={handleUpdateStok}
+              savingItems={savingItems}
             />
           </motion.div>
         )}
